@@ -1,13 +1,26 @@
 import {
+  DEFAULT_ALLOWED_SCHEMES,
   BLANK_URL,
   ctrlCharactersRegex,
   htmlCtrlEntityRegex,
   htmlEntitiesRegex,
-  invalidProtocolRegex,
+  invalidProtocolMatchRegex,
+  MAX_DECODE_ITERATIONS,
   relativeFirstCharacters,
+  strictUrlSchemeRegex,
+  urlSchemeMatchRegex,
   whitespaceEscapeCharsRegex,
-  urlSchemeRegex,
 } from "./constants";
+
+export interface SanitizeUrlOptions {
+  /**
+   * Explicitly registered schemes (with or without a trailing colon) that
+   * are permitted in addition to the default allowlist when the allowlist
+   * mode is enabled. Passing this opts the sanitizer into default-deny
+   * mode: any scheme not on the allowlist is replaced with about:blank.
+   */
+  allowedSchemes?: string[];
+}
 
 function isRelativeUrlWithoutProtocol(url: string): boolean {
   return relativeFirstCharacters.indexOf(url[0]) > -1;
@@ -35,12 +48,41 @@ function decodeURI(uri: string): string {
   }
 }
 
-export function sanitizeUrl(url?: string): string {
-  if (!url) {
-    return BLANK_URL;
+function normalizeRegisteredScheme(scheme: string): string {
+  return scheme.trim().toLowerCase().replace(/:+$/, "");
+}
+
+function extractScheme(url: string): string | null {
+  const strictSchemeMatch = url.match(strictUrlSchemeRegex);
+
+  if (strictSchemeMatch) {
+    return strictSchemeMatch[0].toLowerCase();
   }
 
+  // The loose regex also recognizes "&colon;" based scheme smuggling
+  // variants such as "javascript&colon;alert(1)", which the strict RFC
+  // grammar cannot express.
+  const looseSchemeMatch = url.match(urlSchemeMatchRegex);
+
+  if (looseSchemeMatch) {
+    return looseSchemeMatch[0].toLowerCase().trim();
+  }
+
+  return null;
+}
+
+function hasRemainingEncodedCharacters(url: string): RegExpMatchArray | null {
+  return (
+    url.match(ctrlCharactersRegex) ||
+    url.match(htmlEntitiesRegex) ||
+    url.match(htmlCtrlEntityRegex) ||
+    url.match(whitespaceEscapeCharsRegex)
+  );
+}
+
+function normalizeDecodedUrl(url: string): string {
   let charsToDecode;
+  let iteration = 0;
   let decodedUrl = decodeURI(url.trim());
 
   do {
@@ -52,14 +94,81 @@ export function sanitizeUrl(url?: string): string {
 
     decodedUrl = decodeURI(decodedUrl);
 
-    charsToDecode =
-      decodedUrl.match(ctrlCharactersRegex) ||
-      decodedUrl.match(htmlEntitiesRegex) ||
-      decodedUrl.match(htmlCtrlEntityRegex) ||
-      decodedUrl.match(whitespaceEscapeCharsRegex);
-  } while (charsToDecode && charsToDecode.length > 0);
+    charsToDecode = hasRemainingEncodedCharacters(decodedUrl);
 
-  const sanitizedUrl = decodedUrl;
+    iteration += 1;
+  } while (
+    charsToDecode &&
+    charsToDecode.length > 0 &&
+    iteration < MAX_DECODE_ITERATIONS
+  );
+
+  // Decode depth exhausted while obfuscated characters remain; treat the
+  // input as an evasion attempt rather than continuing unbounded.
+  if (charsToDecode && charsToDecode.length > 0) {
+    return BLANK_URL;
+  }
+
+  return decodedUrl;
+}
+
+function buildAllowedSchemes(registeredSchemes: string[] = []): Set<string> {
+  const allowedSchemes = new Set(
+    registeredSchemes.map(normalizeRegisteredScheme),
+  );
+  DEFAULT_ALLOWED_SCHEMES.forEach((scheme) => {
+    allowedSchemes.add(normalizeRegisteredScheme(scheme));
+  });
+
+  return allowedSchemes;
+}
+
+function isAllowlistedScheme(
+  url: string,
+  allowedSchemes: Set<string>,
+): boolean {
+  const strictSchemeMatch = url.match(strictUrlSchemeRegex);
+
+  if (!strictSchemeMatch) {
+    return false;
+  }
+
+  const strictScheme = strictSchemeMatch[0].slice(0, -1).toLowerCase();
+
+  return allowedSchemes.has(strictScheme);
+}
+
+function normalizeWebUrl(url: string): string {
+  if (!isValidUrl(url)) {
+    return BLANK_URL;
+  }
+
+  const parsedUrl = new URL(url);
+  parsedUrl.protocol = parsedUrl.protocol.toLowerCase();
+  parsedUrl.hostname = parsedUrl.hostname.toLowerCase();
+
+  return parsedUrl.toString();
+}
+
+export function sanitizeUrl(
+  url?: string | null,
+  options?: SanitizeUrlOptions,
+): string {
+  if (!url) {
+    return BLANK_URL;
+  }
+
+  const allowlistMode = typeof options === "object" && options !== null;
+  const allowedSchemes = buildAllowedSchemes(options?.allowedSchemes);
+  const decodedUrl = normalizeDecodedUrl(url);
+
+  if (decodedUrl === BLANK_URL) {
+    return BLANK_URL;
+  }
+
+  // Normalize backslashes before any scheme inspection so that backslash
+  // variants cannot smuggle a scheme past the checks.
+  const sanitizedUrl = decodedUrl.replace(/\\/g, "/");
 
   if (!sanitizedUrl) {
     return BLANK_URL;
@@ -69,39 +178,31 @@ export function sanitizeUrl(url?: string): string {
     return sanitizedUrl;
   }
 
-  // Remove any leading whitespace before checking the URL scheme
-  const trimmedUrl = sanitizedUrl.trimStart();
-  const urlSchemeParseResults = trimmedUrl.match(urlSchemeRegex);
+  const urlScheme = extractScheme(sanitizedUrl);
 
-  if (!urlSchemeParseResults) {
+  if (urlScheme === null) {
     return sanitizedUrl;
   }
 
-  const urlScheme = urlSchemeParseResults[0].toLowerCase().trim();
-
-  if (invalidProtocolRegex.test(urlScheme)) {
+  if (invalidProtocolMatchRegex.test(urlScheme)) {
     return BLANK_URL;
   }
 
-  const backSanitized = trimmedUrl.replace(/\\/g, "/");
+  if (allowlistMode && !isAllowlistedScheme(sanitizedUrl, allowedSchemes)) {
+    return BLANK_URL;
+  }
 
-  // Handle special cases for mailto: and custom deep-link protocols
-  if (urlScheme === "mailto:" || urlScheme.includes("://")) {
-    return backSanitized;
+  const lowerCaseScheme = urlScheme.toLowerCase();
+
+  // Handle special case for mailto, which has no // authority
+  if (lowerCaseScheme === "mailto:") {
+    return sanitizedUrl;
   }
 
   // For http and https URLs, perform additional validation
-  if (urlScheme === "http:" || urlScheme === "https:") {
-    if (!isValidUrl(backSanitized)) {
-      return BLANK_URL;
-    }
-
-    const url = new URL(backSanitized);
-    url.protocol = url.protocol.toLowerCase();
-    url.hostname = url.hostname.toLowerCase();
-
-    return url.toString();
+  if (lowerCaseScheme === "http:" || lowerCaseScheme === "https:") {
+    return normalizeWebUrl(sanitizedUrl);
   }
 
-  return backSanitized;
+  return sanitizedUrl;
 }

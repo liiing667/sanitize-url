@@ -28,6 +28,44 @@ sanitizeUrl(
 ); // 'about:blank'
 ```
 
+## Allowlist mode
+
+By default `sanitizeUrl` keeps its historical, backwards-compatible
+blacklist behavior: only `javascript:`, `data:` and `vbscript:` are blocked,
+while any other scheme is passed through.
+
+Pass an options object as the second argument to opt into default-deny
+(allowlist) mode instead. In this mode every scheme must be explicitly
+allowed:
+
+- `http:`, `https:` and `mailto:` are always allowed.
+- Relative references (`./path`, `/path`, `//host/path`) and scheme-less
+  strings (for example `www.example.com`) are always allowed.
+- Any other scheme is replaced with `about:blank` unless it is registered
+  through `allowedSchemes`. Scheme names are case-insensitive and the
+  trailing colon is optional.
+
+```js
+// Unknown schemes and unregistered deep links are rejected.
+sanitizeUrl("com.example.app://deep/link", {}); // 'about:blank'
+
+// Register the deep-link schemes your application trusts.
+sanitizeUrl("com.example.app://deep/link", {
+  allowedSchemes: ["com.example.app"],
+}); // 'com.example.app://deep/link'
+
+// The built-in blacklist still applies, even to registered schemes.
+sanitizeUrl("javascript:alert(1)", {
+  allowedSchemes: ["javascript"],
+}); // 'about:blank'
+```
+
+The input is repeatedly decoded (HTML entities and percent encoding), has
+control and whitespace-escape characters stripped, and has backslashes
+normalized to forward slashes before the scheme is inspected. Repeated
+decoding is bounded; input that is still obfuscated after the decode limit
+is reached is replaced with `about:blank`.
+
 ## Testing
 
 This library uses [Vitest](https://vitest.dev/). All testing dependencies

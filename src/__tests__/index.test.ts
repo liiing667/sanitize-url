@@ -1,6 +1,6 @@
 /* eslint-disable no-script-url */
 import { sanitizeUrl } from "..";
-import { BLANK_URL } from "../constants";
+import { BLANK_URL, MAX_DECODE_ITERATIONS } from "../constants";
 
 describe("sanitizeUrl", () => {
   it("does not alter http URLs with alphanumeric characters", () => {
@@ -255,9 +255,162 @@ describe("sanitizeUrl", () => {
 
       it(`does not replace ${protocol}: if it is not in the scheme of the URL`, () => {
         expect(sanitizeUrl(`http://example.com#${protocol}:foo`)).toBe(
-          `http://example.com#${protocol}:foo`,
+          `http://example.com/#${protocol}:foo`,
         );
       });
     });
+  });
+
+  describe("legacy blacklist behavior without options", () => {
+    it("still allows unknown deep-link schemes when no options are passed", () => {
+      expect(sanitizeUrl("com.braintreepayments.demo://example")).toBe(
+        "com.braintreepayments.demo://example",
+      );
+    });
+
+    it("still allows unknown schemes without an authority when no options are passed", () => {
+      expect(sanitizeUrl("customthing:whatever")).toBe("customthing:whatever");
+    });
+
+    it("normalizes backslashes before scheme detection in legacy mode", () => {
+      expect(sanitizeUrl("https:\\\\example.com")).toBe("https://example.com/");
+    });
+
+    it("treats a backslash-prefixed javascript string as a relative path", () => {
+      expect(sanitizeUrl("\\javascript:alert()")).toBe("/javascript:alert()");
+    });
+  });
+
+  describe("allowlist mode", () => {
+    it("allows http and https by default", () => {
+      expect(sanitizeUrl("http://example.com", {})).toBe("http://example.com/");
+      expect(sanitizeUrl("https://example.com", {})).toBe(
+        "https://example.com/",
+      );
+    });
+
+    it("allows mailto by default", () => {
+      expect(sanitizeUrl("mailto:test@example.com?subject=hello", {})).toBe(
+        "mailto:test@example.com?subject=hello",
+      );
+    });
+
+    it("allows relative urls without a scheme", () => {
+      expect(sanitizeUrl("./path/to/my.json", {})).toBe("./path/to/my.json");
+      expect(sanitizeUrl("/path/to/my.json", {})).toBe("/path/to/my.json");
+      expect(sanitizeUrl("//example.com/robots.txt", {})).toBe(
+        "//example.com/robots.txt",
+      );
+      expect(sanitizeUrl("www.example.com", {})).toBe("www.example.com");
+    });
+
+    it("replaces unknown deep-link schemes with about:blank", () => {
+      expect(sanitizeUrl("com.braintreepayments.demo://example", {})).toBe(
+        BLANK_URL,
+      );
+      expect(sanitizeUrl("my-app://deep/link", {})).toBe(BLANK_URL);
+      expect(sanitizeUrl("customthing:whatever", {})).toBe(BLANK_URL);
+    });
+
+    it("allows explicitly registered deep-link schemes", () => {
+      expect(
+        sanitizeUrl("com.braintreepayments.demo://example", {
+          allowedSchemes: ["com.braintreepayments.demo"],
+        }),
+      ).toBe("com.braintreepayments.demo://example");
+
+      expect(
+        sanitizeUrl("my-app://deep/link", {
+          allowedSchemes: ["my-app:"],
+        }),
+      ).toBe("my-app://deep/link");
+    });
+
+    it("accepts registered schemes case-insensitively and with surrounding whitespace", () => {
+      expect(
+        sanitizeUrl("MY-APP://deep/link", {
+          allowedSchemes: ["  My-App:: "],
+        }),
+      ).toBe("MY-APP://deep/link");
+    });
+
+    it("still blocks javascript, data and vbscript when registered", () => {
+      expect(
+        sanitizeUrl("javascript:alert(1)", {
+          allowedSchemes: ["javascript"],
+        }),
+      ).toBe(BLANK_URL);
+      expect(
+        sanitizeUrl("data:text/html,hi", { allowedSchemes: ["data"] }),
+      ).toBe(BLANK_URL);
+      expect(
+        sanitizeUrl("vbscript:msgbox(1)", {
+          allowedSchemes: ["vbscript"],
+        }),
+      ).toBe(BLANK_URL);
+    });
+
+    it("rejects obfuscated schemes that do not match a strict scheme grammar", () => {
+      expect(sanitizeUrl("java&colon;script:alert(1)", {})).toBe(BLANK_URL);
+      expect(sanitizeUrl("&!*my-app://evil", {})).toBe(BLANK_URL);
+    });
+
+    it("normalizes backslashes before the allowlist scheme check", () => {
+      expect(
+        sanitizeUrl("my-app:\\\\deep\\link", {
+          allowedSchemes: ["my-app"],
+        }),
+      ).toBe("my-app://deep/link");
+
+      expect(
+        sanitizeUrl("evil-scheme:\\\\deep", {
+          allowedSchemes: ["my-app"],
+        }),
+      ).toBe(BLANK_URL);
+    });
+
+    it("keeps http/https url normalization in allowlist mode", () => {
+      expect(sanitizeUrl("https://EXAMPLE.com:4567/path", {})).toBe(
+        "https://example.com:4567/path",
+      );
+
+      expect(
+        sanitizeUrl("https://example.com", {
+          allowedSchemes: ["my-app"],
+        }),
+      ).toBe("https://example.com/");
+    });
+
+    it("rejects malformed http and https urls", () => {
+      expect(sanitizeUrl("https://", {})).toBe(BLANK_URL);
+    });
+  });
+
+  describe("decode depth", () => {
+    const wrapHtmlEntity = (value: string): string =>
+      value
+        .split("")
+        .map((char) => `&#${char.charCodeAt(0)};`)
+        .join("");
+
+    it("still decodes shallowly nested html entities", () => {
+      const shallow = wrapHtmlEntity(wrapHtmlEntity("https://example.com"));
+
+      expect(sanitizeUrl(shallow)).toBe("https://example.com/");
+    });
+
+    it("replaces urls whose encoding exceeds the repeated decode depth", () => {
+      // Every full-entity wrap needs its own decode pass, so a chain one
+      // layer deeper than MAX_DECODE_ITERATIONS cannot finish decoding and
+      // is treated as an evasion attempt. A chain at exactly the limit
+      // still decodes normally.
+      let overLimit = "A";
+      for (let index = 0; index < MAX_DECODE_ITERATIONS + 1; index += 1) {
+        overLimit = wrapHtmlEntity(overLimit);
+      }
+
+      expect(sanitizeUrl(overLimit)).toBe(BLANK_URL);
+      expect(sanitizeUrl(overLimit, {})).toBe(BLANK_URL);
+    }, 30000);
   });
 });
